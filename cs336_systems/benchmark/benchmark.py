@@ -11,6 +11,7 @@ import timeit
 import statistics
 import torch
 import torch.nn as nn
+import torch.cuda.nvtx as nvtx
 
 from cs336_basics.model import BasicsTransformerLM
 
@@ -58,46 +59,51 @@ def benchmark_model(
     forward_times = []
     backward_times = []
 
-    # Warm-up steps
-    for _ in range(warmup_steps):
-        if forward_only:
-            _ = model(batch)
-        else:
-            model.zero_grad()
-            output = model(batch)
-            # Create a dummy loss (sum of logits)
-            loss = output.sum()
-            loss.backward()
-        torch.cuda.synchronize()
+    # Warm-up steps (marked with NVTX so we can filter them out in nsys)
+    with nvtx.range("warmup"):
+        for _ in range(warmup_steps):
+            if forward_only:
+                _ = model(batch)
+            else:
+                model.zero_grad()
+                output = model(batch)
+                # Create a dummy loss (sum of logits)
+                loss = output.sum()
+                loss.backward()
+            torch.cuda.synchronize()
 
-    # Timing steps
-    for _ in range(num_steps):
-        if forward_only:
-            # Forward pass timing only
-            torch.cuda.synchronize()  # Ensure previous operations are done
-            start_time = timeit.default_timer()
-            _ = model(batch)
-            torch.cuda.synchronize()  # Wait for forward pass to complete
-            forward_time = timeit.default_timer() - start_time
-            forward_times.append(forward_time)
-        else:
-            # Forward pass timing
-            model.zero_grad()  # Clear gradients
-            torch.cuda.synchronize()  # Ensure previous operations are done
-            start_time = timeit.default_timer()
-            output = model(batch)
-            torch.cuda.synchronize()  # Wait for forward pass to complete
-            forward_time = timeit.default_timer() - start_time
-            forward_times.append(forward_time)
+    # Timing steps (marked with NVTX for profiling)
+    for step in range(num_steps):
+        with nvtx.range(f"step_{step}"):
+            if forward_only:
+                # Forward pass timing only
+                torch.cuda.synchronize()  # Ensure previous operations are done
+                start_time = timeit.default_timer()
+                with nvtx.range("forward_pass"):
+                    _ = model(batch)
+                torch.cuda.synchronize()  # Wait for forward pass to complete
+                forward_time = timeit.default_timer() - start_time
+                forward_times.append(forward_time)
+            else:
+                # Forward pass timing
+                model.zero_grad()  # Clear gradients
+                torch.cuda.synchronize()  # Ensure previous operations are done
+                start_time = timeit.default_timer()
+                with nvtx.range("forward_pass"):
+                    output = model(batch)
+                torch.cuda.synchronize()  # Wait for forward pass to complete
+                forward_time = timeit.default_timer() - start_time
+                forward_times.append(forward_time)
 
-            # Backward pass timing
-            torch.cuda.synchronize()  # Ensure forward pass is done
-            start_time = timeit.default_timer()
-            loss = output.sum()
-            loss.backward()
-            torch.cuda.synchronize()  # Wait for backward pass to complete
-            backward_time = timeit.default_timer() - start_time
-            backward_times.append(backward_time)
+                # Backward pass timing
+                torch.cuda.synchronize()  # Ensure forward pass is done
+                start_time = timeit.default_timer()
+                with nvtx.range("backward_pass"):
+                    loss = output.sum()
+                    loss.backward()
+                torch.cuda.synchronize()  # Wait for backward pass to complete
+                backward_time = timeit.default_timer() - start_time
+                backward_times.append(backward_time)
 
     return forward_times, backward_times
 
