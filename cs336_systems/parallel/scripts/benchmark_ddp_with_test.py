@@ -19,6 +19,7 @@ Examples:
     python scripts/test_naive_ddp.py
 """
 
+import argparse
 import os
 import tempfile
 import time
@@ -31,6 +32,9 @@ from copy import deepcopy
 
 # Import the naive DDP implementation
 from cs336_systems.parallel.naive_ddp import NaiveDDP
+from cs336_systems.parallel.flattened_ddp import FlattenedDDP
+from cs336_systems.parallel.overlapped_ddp import OverlappedDDP
+from cs336_systems.parallel.bucketed_ddp import BucketedDDP
 
 
 class SimpleToyModel(nn.Module):
@@ -134,7 +138,7 @@ def train_single_process(model, data, labels, num_epochs=10, lr=0.01):
 
 def train_ddp_process(rank, world_size, model_state_dict, all_data, all_labels, 
                       num_epochs=10, lr=0.01, backend="gloo", result_file=None, 
-                      timing_file=None):
+                      timing_file=None, ddp_type="naive", bucket_size_mb=25.0):
     """Train a model using DDP in a single process.
     
     Args:
@@ -156,8 +160,17 @@ def train_ddp_process(rank, world_size, model_state_dict, all_data, all_labels,
     model.load_state_dict(model_state_dict)
     model = model.to(device)
     
-    # Wrap with NaiveDDP
-    ddp_model = NaiveDDP(model)
+    # Wrap with DDP based on type
+    if ddp_type == "naive":
+        ddp_model = NaiveDDP(model)
+    elif ddp_type == "flattened":
+        ddp_model = FlattenedDDP(model)
+    elif ddp_type == "overlapped":
+        ddp_model = OverlappedDDP(model)
+    elif ddp_type == "bucketed":
+        ddp_model = BucketedDDP(model, bucket_size_mb=bucket_size_mb)
+    else:
+        raise ValueError(f"Unknown DDP type: {ddp_type}")
     
     # Split data across ranks
     batch_size = all_data.size(0)
@@ -179,7 +192,11 @@ def train_ddp_process(rank, world_size, model_state_dict, all_data, all_labels,
         outputs = ddp_model(local_data)
         loss = criterion(outputs, local_labels)
         loss.backward()
-        ddp_model.sync_gradients()
+        # Synchronize gradients based on DDP type
+        if ddp_type == "overlapped" or ddp_type == "bucketed":
+            ddp_model.finish_gradient_synchronization()
+        else:
+            ddp_model.sync_gradients()
         optimizer.step()
         if backend == "nccl" and torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -198,12 +215,18 @@ def train_ddp_process(rank, world_size, model_state_dict, all_data, all_labels,
         loss.backward()
         
         # Measure communication time
+        # For overlapped DDP, communication happens during backward pass
+        # We measure the time to finish synchronization (waiting for async ops)
         if backend == "nccl" and torch.cuda.is_available():
             torch.cuda.synchronize()
         comm_start = time.time()
         
         # Synchronize gradients after backward pass
-        ddp_model.sync_gradients()
+        # For overlapped and bucketed DDP, this waits for all async all-reduces to complete
+        if ddp_type == "overlapped" or ddp_type == "bucketed":
+            ddp_model.finish_gradient_synchronization()
+        else:
+            ddp_model.sync_gradients()
         
         if backend == "nccl" and torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -251,10 +274,10 @@ def train_ddp_process(rank, world_size, model_state_dict, all_data, all_labels,
 
 
 def run_ddp_training(rank, world_size, model_state_dict, all_data, all_labels, 
-                     num_epochs, lr, backend, result_file, timing_file):
+                     num_epochs, lr, backend, result_file, timing_file, ddp_type, bucket_size_mb):
     """Wrapper function for multiprocessing spawn."""
     train_ddp_process(rank, world_size, model_state_dict, all_data, all_labels,
-                     num_epochs, lr, backend, result_file, timing_file)
+                     num_epochs, lr, backend, result_file, timing_file, ddp_type, bucket_size_mb)
 
 
 def compare_models(state_dict1, state_dict2, tolerance=1e-5):
@@ -298,23 +321,74 @@ def compare_models(state_dict1, state_dict2, tolerance=1e-5):
 
 def main():
     """Main test function."""
+    parser = argparse.ArgumentParser(
+        description="Benchmark DDP implementations with a toy model"
+    )
+
+    # DDP configuration
+    parser.add_argument(
+        "--ddp_type", type=str, default="naive",
+        choices=["naive", "flattened", "overlapped", "bucketed"],
+        help="Type of DDP implementation (default: naive)"
+    )
+    parser.add_argument(
+        "--bucket_size_mb", type=float, default=25.0,
+        help="Bucket size in MB for bucketed DDP (default: 25.0, only used when ddp_type=bucketed)"
+    )
+    parser.add_argument(
+        "--world_size", type=int, default=2,
+        help="Number of processes / GPUs (default: 2)"
+    )
+    parser.add_argument(
+        "--num_epochs", type=int, default=10,
+        help="Number of training epochs (default: 10)"
+    )
+    parser.add_argument(
+        "--lr", type=float, default=0.01,
+        help="Learning rate (default: 0.01)"
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=100,
+        help="Batch size (default: 100)"
+    )
+    parser.add_argument(
+        "--input_size", type=int, default=10,
+        help="Input size of the toy model (default: 10)"
+    )
+    parser.add_argument(
+        "--output_size", type=int, default=5,
+        help="Output size of the toy model (default: 5)"
+    )
+    parser.add_argument(
+        "--backend", type=str, default="nccl",
+        choices=["nccl", "gloo"],
+        help="Distributed backend (default: nccl)"
+    )
+
+    args = parser.parse_args()
+
     print("=" * 80)
-    print("Testing Naive DDP Implementation")
+    print("Testing DDP Implementations with Toy Model")
     print("=" * 80)
     
     # Set random seed for reproducibility
     torch.manual_seed(42)
     
     # Configuration
-    world_size = 2
-    num_epochs = 10
-    lr = 0.01
-    batch_size = 100
-    input_size = 10
-    output_size = 5
-    backend = "nccl"  # Use gloo for CPU, can switch to "nccl" for GPU
+    world_size = args.world_size
+    num_epochs = args.num_epochs
+    lr = args.lr
+    batch_size = args.batch_size
+    input_size = args.input_size
+    output_size = args.output_size
+    backend = args.backend
+    ddp_type = args.ddp_type
+    bucket_size_mb = args.bucket_size_mb
     
     print(f"\nConfiguration:")
+    print(f"  DDP Type: {ddp_type}")
+    if ddp_type == "bucketed":
+        print(f"  Bucket Size: {bucket_size_mb} MB")
     print(f"  World size: {world_size}")
     print(f"  Number of epochs: {num_epochs}")
     print(f"  Learning rate: {lr}")
@@ -343,7 +417,7 @@ def main():
     
     # Train with DDP
     print(f"\n{'=' * 80}")
-    print(f"Training with DDP ({world_size} processes)...")
+    print(f"Training with DDP ({world_size} processes, {ddp_type} mode)...")
     print(f"{'=' * 80}")
     
     # Use temporary files to store results and timing
@@ -357,7 +431,7 @@ def main():
         mp.spawn(
             run_ddp_training,
             args=(world_size, deepcopy(initial_state_dict), all_data, all_labels, 
-                  num_epochs, lr, backend, result_file, timing_file),
+                  num_epochs, lr, backend, result_file, timing_file, ddp_type, bucket_size_mb),
             nprocs=world_size,
             join=True
         )
@@ -398,17 +472,26 @@ def main():
         print(f"Total communication time: {timing_stats['total_communication_time']:.3f} s")
         print(f"Communication overhead: {timing_stats['communication_ratio']*100:.2f}%")
         print(f"\nDetailed breakdown:")
-        print(f"  - Computation time per iteration: {(timing_stats['avg_iteration_time'] - timing_stats['avg_communication_time'])*1000:.2f} ms")
+        computation_time = timing_stats['avg_iteration_time'] - timing_stats['avg_communication_time']
+        print(f"  - Computation time per iteration: {computation_time*1000:.2f} ms")
         print(f"  - Communication time per iteration: {timing_stats['avg_communication_time']*1000:.2f} ms")
-        print(f"  - Communication/Computation ratio: {timing_stats['avg_communication_time'] / (timing_stats['avg_iteration_time'] - timing_stats['avg_communication_time']) if (timing_stats['avg_iteration_time'] - timing_stats['avg_communication_time']) > 0 else 0:.2f}x")
-    
+        if computation_time > 0:
+            comm_comp_ratio = timing_stats['avg_communication_time'] / computation_time
+            print(f"  - Communication/Computation ratio: {comm_comp_ratio:.2f}x")
+        
+        # Add DDP type and bucket size to timing stats for easier debugging/logging
+        timing_stats['ddp_type'] = ddp_type
+        timing_stats['bucket_size_mb'] = bucket_size_mb
+        # Save timing stats with ddp_type and bucket_size_mb for easy processing
+        torch.save(timing_stats, timing_file)
+
     print(f"\n{'=' * 80}")
     if models_match:
         print("✓ SUCCESS: DDP training produces identical weights to single-process training!")
-        print("  The naive DDP implementation is correct.")
+        print("  The DDP implementation is correct.")
     else:
         print("✗ FAILURE: DDP training produces different weights!")
-        print("  The naive DDP implementation may have bugs.")
+        print("  The DDP implementation may have bugs.")
     print(f"{'=' * 80}\n")
 
 

@@ -52,8 +52,8 @@ def get_ddp_individual_parameters(module: torch.nn.Module) -> torch.nn.Module:
     Returns:
         Instance of a DDP class.
     """
-    # For example: return DDPIndividualParameters(module)
-    raise NotImplementedError
+    from cs336_systems.parallel.overlapped_ddp import OverlappedDDP
+    return OverlappedDDP(module)
 
 
 def ddp_individual_parameters_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -67,8 +67,15 @@ def ddp_individual_parameters_on_after_backward(ddp_model: torch.nn.Module, opti
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    # For example: ddp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    # Call finish_gradient_synchronization to wait for all async all-reduce operations
+    # to complete before the optimizer step
+    if hasattr(ddp_model, 'finish_gradient_synchronization'):
+        ddp_model.finish_gradient_synchronization()
+    else:
+        raise AttributeError(
+            "DDP model does not have finish_gradient_synchronization method. "
+            "Make sure you're using OverlappedDDP or a compatible DDP implementation."
+        )
 
 
 def get_ddp_bucketed(module: torch.nn.Module, bucket_size_mb: float) -> torch.nn.Module:
@@ -89,7 +96,8 @@ def get_ddp_bucketed(module: torch.nn.Module, bucket_size_mb: float) -> torch.nn
     Returns:
         Instance of a DDP class.
     """
-    raise NotImplementedError
+    from cs336_systems.parallel.bucketed_ddp import BucketedDDP
+    return BucketedDDP(module, bucket_size_mb=bucket_size_mb)
 
 
 def ddp_bucketed_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -103,8 +111,15 @@ def ddp_bucketed_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    # For example: ddp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    # Call finish_gradient_synchronization to wait for all async bucket all-reduce operations
+    # to complete before the optimizer step
+    if hasattr(ddp_model, 'finish_gradient_synchronization'):
+        ddp_model.finish_gradient_synchronization()
+    else:
+        raise AttributeError(
+            "DDP model does not have finish_gradient_synchronization method. "
+            "Make sure you're using BucketedDDP or a compatible DDP implementation."
+        )
 
 
 def ddp_bucketed_on_train_batch_start(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -116,8 +131,19 @@ def ddp_bucketed_on_train_batch_start(ddp_model: torch.nn.Module, optimizer: tor
             DDP-wrapped model.
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
+    
+    Note:
+        This function is optional. The BucketedDDP implementation automatically
+        clears communication handles and bucket state in the forward() method,
+        so this function can be a no-op. However, we keep it for consistency
+        with the test interface and potential future use cases.
     """
-    raise NotImplementedError
+    # The BucketedDDP.forward() method already clears communication handles
+    # and bucket ready tracking at the start of each forward pass.
+    # This function is kept for interface consistency but is essentially a no-op
+    # since the state will be cleared when forward() is called.
+    # If needed in the future, we could add explicit state clearing here.
+    pass
 
 
 def get_sharded_optimizer(params, optimizer_cls: Type[torch.optim.Optimizer], **kwargs) -> torch.optim.Optimizer:
